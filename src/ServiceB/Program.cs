@@ -6,7 +6,7 @@ const string ServiceName = "service-b";
 app.MapGet("/", () => Results.Ok(new { service = ServiceName, message = "ok" }));
 
 
-app.MapGet("/ping", () => Results.Ok("pong"));
+app.MapGet("/ping", () => Results.Ok(new { service = ServiceName, message = "pong" }));
 
 app.MapGet("/slow", async (int ms = 500) =>
 {
