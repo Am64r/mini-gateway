@@ -1,0 +1,26 @@
+# Build outputs
+bin/
+obj/
+publish/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Logs
+*.log
+logs/
+
+# Environment (contains local config)
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test results
+TestResults/
+coverage/

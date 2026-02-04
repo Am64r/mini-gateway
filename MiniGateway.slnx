@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Gateway/Gateway.csproj" />
+    <Project Path="src/ServiceA/ServiceA.csproj" />
+    <Project Path="src/ServiceB/ServiceB.csproj" />
+  </Folder>
+</Solution>
