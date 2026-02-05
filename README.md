@@ -10,46 +10,37 @@ sequenceDiagram
     participant G as Gateway
     participant U as Upstream (ServiceA/B)
 
-    C->>G: GET /api/a/ping
-    
-    Note over G: 1. Route Matching
-    G->>G: TryMatch("/api/a/ping", routes)
-    G->>G: Match: /api/a → localhost:5051
-    G->>G: Forward path: /ping
-
-    Note over G: 2. Auth gate (edge API key)
-    G->>G: IsAnonymousPath(/ping)?
-    alt anonymous
-        G->>G: Skip auth
-    else not anonymous
-        G->>G: Validate X-Api-Key
-        alt missing/invalid
-            G-->>C: 401 Unauthorized
-            Note over G: Reject before proxying upstream
-        end
-    end
-    
-    Note over G: 3. Build Upstream Request
-    G->>G: Copy method (GET)
-    G->>G: Filter headers (strip hop-by-hop, strip X-Api-Key)
-    G->>G: Ensure X-Correlation-Id (generate if missing)
-    G->>G: Wrap body as stream (if present)
-    
-    Note over G: 4. Send (streaming + timeout + cancellation)
-    G->>G: Create linked token (client disconnect OR timeout)
-    G->>U: GET /ping
-    alt upstream responds in time
-        U-->>G: 200 OK + body stream
-    else timeout budget exceeded
-        G-->>C: 504 Gateway Timeout
-        Note over G: Cancel upstream request + stop copying
-    end
-    
-    Note over G: 5. Stream Response
-    G->>G: Copy status + headers
-    G->>G: Echo X-Correlation-Id to client
-    G-->>C: 200 OK + body stream
+    C->>G: request (/api/a/* or /api/b/*)
+    G->>G: route match + auth check + timeout budget
+    G->>G: ensure X-Correlation-Id
+    G->>U: forward (streaming)
+    U-->>G: response (streaming)
+    G-->>C: response (+ X-Correlation-Id)
 ```
+
+### Decision flow (auth + timeout)
+
+```mermaid
+flowchart TD
+    R[Request arrives at Gateway] --> M{Route match?}
+    M -- no --> N[404]
+    M -- yes --> A{Anonymous path?}
+    A -- yes --> F[Forward upstream]
+    A -- no --> K{Valid X-Api-Key?}
+    K -- no --> U401[401]
+    K -- yes --> F[Forward upstream]
+    F --> T{Finished before timeout?}
+    T -- no --> U504[504 + cancel upstream]
+    T -- yes --> OK[Return upstream response]
+```
+
+### Response codes (gateway)
+
+| Status | Meaning |
+|---|---|
+| 401 | Missing/invalid `X-Api-Key` (non-anonymous route) |
+| 404 | No matching route prefix |
+| 504 | Upstream exceeded per-route timeout budget |
 
 ## Architecture
 
