@@ -1,4 +1,3 @@
-using System.ComponentModel;
 using System.Net.Http.Headers;
 
 namespace Gateway;
@@ -39,7 +38,7 @@ public static class Proxy
 
         // 1. Match route: find upstream for this path prefix
         var requestPath = ctx.Request.Path.Value ?? "/";
-        if (!TryMatch(requestPath, routes, out var upstreamBase, out var forwardPath, out var routeTimeout))
+        if (!TryMatch(requestPath, routes, out var upstreamBase, out var forwardPath, out var routeTimeout, out var routeConfig))
         {
             ctx.Response.StatusCode = StatusCodes.Status404NotFound;
             await ctx.Response.WriteAsync("No route matched.");
@@ -54,13 +53,26 @@ public static class Proxy
             return;
         }
 
+        var expectedKey = Environment.GetEnvironmentVariable("API_KEY");
+        if (string.IsNullOrWhiteSpace(expectedKey))
+            throw new Exception("API_KEY not set in .env");
+
+        var isAnonymous = Auth.IsAnonymousPath(forwardPath, routeConfig.AllowAnonymousPrefixes);
+
+        if (!isAnonymous && !Auth.HasValidApiKey(ctx, expectedKey))
+        {
+            ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            await ctx.Response.WriteAsync("Missing or invalid X-Api-Key");
+            return;
+        }
+
         // 2. Build upstream URI: /api/a/ping?x=1 → http://localhost:5051/ping?x=1
         var upstreamUri = BuildUpstreamUri(upstreamBase, forwardPath, ctx.Request.QueryString.Value);
 
         // 3. Create upstream request with method, filtered headers, body stream
         using var upstreamRequest = CreateUpstreamRequest(ctx.Request, upstreamUri, correlationId);
 
-        using var timeoutCts = new CancellationTokenSource(routeTimeout);
+        using var timeoutCts = new CancellationTokenSource(routeConfig.Timeout);
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted, timeoutCts.Token);
 
         // 4. Send request
@@ -85,7 +97,7 @@ public static class Proxy
                 upstreamUri.ToString(),
                 (int)upstreamResponse.StatusCode,
                 correlationId,
-                (int)routeTimeout.TotalMilliseconds
+                (int)routeConfig.Timeout.TotalMilliseconds
             );
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !ctx.RequestAborted.IsCancellationRequested)
@@ -145,8 +157,9 @@ public static class Proxy
         foreach (var h in from)
         {
             if (HopByHop.Contains(h.Key)) continue;
-
             if (h.Key.Equals(CorrelationHeader, StringComparison.OrdinalIgnoreCase)) continue;
+            if (h.Key.Equals(Auth.ApiKeyHeader, StringComparison.OrdinalIgnoreCase)) continue;
+
 
             // Try request headers first, fall back to content headers
             if (!to.Headers.TryAddWithoutValidation(h.Key, h.Value.ToArray()))
@@ -174,11 +187,13 @@ public static class Proxy
         IReadOnlyDictionary<string, RouteConfig> routes,
         out string upstreamBase,
         out string forwardPath,
-        out TimeSpan routeTimeout)
+        out TimeSpan routeTimeout,
+        out RouteConfig routeConfig)
     {
         upstreamBase = "";
         forwardPath = "";
         routeTimeout = default;
+        routeConfig = default!;
         string? match = null;
 
         // Longest prefix wins: /api/a/ping matches "/api/a" over "/api"
@@ -191,9 +206,9 @@ public static class Proxy
 
         if (match is null) return false;
 
-        var cfg = routes[match];
-        upstreamBase = cfg.UpstreamBaseUrl;
-        routeTimeout = cfg.Timeout;
+        routeConfig = routes[match];
+        upstreamBase = routeConfig.UpstreamBaseUrl;
+        routeTimeout = routeConfig.Timeout;
 
         var rest = requestPath.Substring(match.Length);
         forwardPath = string.IsNullOrEmpty(rest) ? "/" : rest.StartsWith("/") ? rest : "/" + rest;

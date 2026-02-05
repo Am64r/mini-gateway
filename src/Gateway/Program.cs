@@ -15,17 +15,20 @@ var routes = new Dictionary<string, RouteConfig>(StringComparer.OrdinalIgnoreCas
 {
     ["/api/a"] = new RouteConfig(
         Environment.GetEnvironmentVariable("UPSTREAM_SERVICE_A") ?? throw new Exception("UPSTREAM_SERVICE_A not set in .env"),
-        TimeSpan.FromMilliseconds(int.TryParse(Environment.GetEnvironmentVariable("TIMEOUT_API_A_MS"), out var a) ? a : 1500)
+        TimeSpan.FromMilliseconds(int.TryParse(Environment.GetEnvironmentVariable("TIMEOUT_API_A_MS"), out var a) ? a : 1500),
+        AllowAnonymousPrefixes: ["/health"]
     ),
     ["/api/b"] = new RouteConfig(
         Environment.GetEnvironmentVariable("UPSTREAM_SERVICE_B") ?? throw new Exception("UPSTREAM_SERVICE_B not set in .env"),
-        TimeSpan.FromMilliseconds(int.TryParse(Environment.GetEnvironmentVariable("TIMEOUT_API_B_MS"), out var b) ? b : 1500)
+        TimeSpan.FromMilliseconds(int.TryParse(Environment.GetEnvironmentVariable("TIMEOUT_API_B_MS"), out var b) ? b : 1500),
+        AllowAnonymousPrefixes: ["/health"]
     ),
 };
 
 // Catch-all route captures every request and forwards to Proxy.HandleAsync
 app.Map("/{**catchall}", (HttpContext ctx, IHttpClientFactory factory) =>
     Proxy.HandleAsync(ctx, factory, routes));
+
 
 app.Run();
 

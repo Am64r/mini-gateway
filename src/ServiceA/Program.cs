@@ -15,6 +15,7 @@ const string ServiceName = "service-a";
 
 app.MapGet("/", () => Results.Ok(new { service = ServiceName, message = "ok" }));
 
+app.MapGet("/health", () => Results.Ok(new { service = ServiceName, message = "healthy" }));
 
 app.MapGet("/ping", () => Results.Ok(new { service = ServiceName, message = "pong" }));
 
