@@ -20,14 +20,16 @@ sequenceDiagram
     Note over G: 2. Build Upstream Request
     G->>G: Copy method (GET)
     G->>G: Filter headers (strip hop-by-hop)
+    G->>G: Ensure X-Correlation-Id (generate if missing)
     G->>G: Wrap body as stream (if present)
     
-    Note over G: 3. Send (streaming)
+    Note over G: 3. Send (streaming + timeout)
     G->>U: GET /ping
     U-->>G: 200 OK + body stream
     
     Note over G: 4. Stream Response
     G->>G: Copy status + headers
+    G->>G: Echo X-Correlation-Id to client
     G-->>C: 200 OK + body stream
 ```
 
@@ -79,6 +81,15 @@ We use `HttpCompletionOption.ResponseHeadersRead` + `StreamContent` to stream bo
 
 Passed to `SendAsync` and `CopyToAsync` to stop wasted work.
 
+### Correlation IDs
+The gateway ensures every request has an `X-Correlation-Id`:
+- If client provides one, we propagate it upstream.
+- Otherwise the gateway generates one.
+- The gateway echoes it back in the response header so you can grep logs across services.
+
+### Timeouts (per route)
+Each route has its own timeout budget. On timeout, the gateway returns `504 Gateway Timeout` and cancels the upstream request.
+
 ## Setup
 
 ```bash
@@ -86,10 +97,12 @@ Passed to `SendAsync` and `CopyToAsync` to stop wasted work.
 cp .env.example .env
 ```
 
-The `.env` file configures upstream URLs:
+The `.env` file configures upstream URLs and per-route timeouts:
 ```
 UPSTREAM_SERVICE_A=http://localhost:5051
 UPSTREAM_SERVICE_B=http://localhost:5052
+TIMEOUT_API_A_MS=1500
+TIMEOUT_API_B_MS=1500
 ```
 
 ## Running
@@ -121,8 +134,8 @@ curl http://localhost:5050/api/b/ping
 
 - [x] **M0**: Skeleton & dev loop
 - [x] **M1**: Reverse proxy routing
-- [ ] **M2**: Correlation IDs & logging
-- [ ] **M3**: Timeouts & cancellation
+- [x] **M2**: Correlation IDs & logging
+- [x] **M3**: Timeouts & cancellation
 - [ ] **M4**: Authentication
 - [ ] **M5**: Rate limiting (429)
 - [ ] **M6**: Concurrency bulkhead (429)
