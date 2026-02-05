@@ -12,17 +12,44 @@ public static class Proxy
         "TE", "Trailer", "Transfer-Encoding", "Upgrade", "Host",
     };
 
+    const string CorrelationHeader = "X-Correlation-Id";
+
     public static async Task HandleAsync(
         HttpContext ctx,
         IHttpClientFactory factory,
         IReadOnlyDictionary<string, string> routes)
     {
+
+        var logger = ctx.RequestServices
+            .GetRequiredService<ILoggerFactory>()
+            .CreateLogger("Gateway");
+
+        // Tries to grab the CorrelationHeader if it exists
+        var correlationId = ctx.Request.Headers[CorrelationHeader].FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(correlationId))
+        {
+            // if correlationId doesn't exist, create a new one
+            correlationId = Guid.NewGuid().ToString();
+        }
+
+        // adds the correlationId to the http response headers
+        // this is what lets the client see the ID the gateway is using
+        ctx.Response.Headers[CorrelationHeader] = correlationId;
+
         // 1. Match route: find upstream for this path prefix
         var requestPath = ctx.Request.Path.Value ?? "/";
         if (!TryMatch(requestPath, routes, out var upstreamBase, out var forwardPath))
         {
             ctx.Response.StatusCode = StatusCodes.Status404NotFound;
             await ctx.Response.WriteAsync("No route matched.");
+
+            // we typically don't need to log 404's since the client should fix their path, 
+            // however we can see debug logs in verbose mode
+            logger.LogDebug(
+                "No route matched: {Path}",
+                requestPath
+            );
+
             return;
         }
 
@@ -30,7 +57,7 @@ public static class Proxy
         var upstreamUri = BuildUpstreamUri(upstreamBase, forwardPath, ctx.Request.QueryString.Value);
 
         // 3. Create upstream request with method, filtered headers, body stream
-        using var upstreamRequest = CreateUpstreamRequest(ctx.Request, upstreamUri);
+        using var upstreamRequest = CreateUpstreamRequest(ctx.Request, upstreamUri, correlationId);
 
         // 4. Send request
         // - ResponseHeadersRead: stream body instead of buffering entire response
@@ -43,14 +70,25 @@ public static class Proxy
 
         // 5. Stream response back to client
         await CopyDownstreamResponse(ctx, upstreamResponse);
+
+        logger.LogInformation(
+            "Proxy {Method} {Path} -> {Upstream} {StatusCode} corr={CorrelationId}",
+            ctx.Request.Method,
+            ctx.Request.Path.Value,
+            upstreamUri.ToString(),
+            (int)upstreamResponse.StatusCode,
+            correlationId
+        );
     }
 
     private static Uri BuildUpstreamUri(string baseUrl, string path, string? query)
         => new Uri($"{baseUrl}{path}{query ?? ""}");
 
-    private static HttpRequestMessage CreateUpstreamRequest(HttpRequest incoming, Uri upstreamUri)
+    private static HttpRequestMessage CreateUpstreamRequest(HttpRequest incoming, Uri upstreamUri, string CorrelationId)
     {
         var req = new HttpRequestMessage(new HttpMethod(incoming.Method), upstreamUri);
+
+        req.Headers.TryAddWithoutValidation(CorrelationHeader, CorrelationId);
 
         // Attach body as stream (no buffering) if present
         if (incoming.ContentLength > 0 || incoming.Headers.ContainsKey("Transfer-Encoding"))
@@ -69,6 +107,8 @@ public static class Proxy
         foreach (var h in from)
         {
             if (HopByHop.Contains(h.Key)) continue;
+
+            if (h.Key.Equals(CorrelationHeader, StringComparison.OrdinalIgnoreCase)) continue;
 
             // Try request headers first, fall back to content headers
             if (!to.Headers.TryAddWithoutValidation(h.Key, h.Value.ToArray()))

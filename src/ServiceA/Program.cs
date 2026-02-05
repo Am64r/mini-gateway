@@ -1,6 +1,16 @@
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
+var logger = app.Logger;
+
+app.Use(async (ctx, next) =>
+{
+    var corr = ctx.Request.Headers["X-Correlation-Id"].FirstOrDefault();
+    logger.LogInformation("ServiceA received {Path} corr={CorrelationId}", ctx.Request.Path.Value, corr ?? "none");
+
+    await next();
+});
+
 const string ServiceName = "service-a";
 
 app.MapGet("/", () => Results.Ok(new { service = ServiceName, message = "ok" }));
