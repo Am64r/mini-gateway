@@ -18,10 +18,14 @@ app.MapGet("/", () => Results.Ok(new { service = ServiceName, message = "ok" }))
 
 app.MapGet("/ping", () => Results.Ok(new { service = ServiceName, message = "pong" }));
 
-app.MapGet("/slow", async (int ms = 500) =>
+app.MapGet("/slow", async (int ms = 500, CancellationToken cancellationToken = default) =>
 {
     ms = Math.Clamp(ms, 0, 30_000);
-    await Task.Delay(ms);
+    logger.LogInformation("ServiceA starting /slow ms={ms}", ms);
+
+    await Task.Delay(ms, cancellationToken);
+
+    logger.LogInformation("ServiceA finished /slow ms={ms}", ms);
     return Results.Ok(new { service = ServiceName, ms });
 });
 

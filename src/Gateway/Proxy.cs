@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Net.Http.Headers;
 
 namespace Gateway;
@@ -17,7 +18,7 @@ public static class Proxy
     public static async Task HandleAsync(
         HttpContext ctx,
         IHttpClientFactory factory,
-        IReadOnlyDictionary<string, string> routes)
+        IReadOnlyDictionary<string, RouteConfig> routes)
     {
 
         var logger = ctx.RequestServices
@@ -38,7 +39,7 @@ public static class Proxy
 
         // 1. Match route: find upstream for this path prefix
         var requestPath = ctx.Request.Path.Value ?? "/";
-        if (!TryMatch(requestPath, routes, out var upstreamBase, out var forwardPath))
+        if (!TryMatch(requestPath, routes, out var upstreamBase, out var forwardPath, out var routeTimeout))
         {
             ctx.Response.StatusCode = StatusCodes.Status404NotFound;
             await ctx.Response.WriteAsync("No route matched.");
@@ -59,26 +60,63 @@ public static class Proxy
         // 3. Create upstream request with method, filtered headers, body stream
         using var upstreamRequest = CreateUpstreamRequest(ctx.Request, upstreamUri, correlationId);
 
+        using var timeoutCts = new CancellationTokenSource(routeTimeout);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted, timeoutCts.Token);
+
         // 4. Send request
         // - ResponseHeadersRead: stream body instead of buffering entire response
         // - ctx.RequestAborted: cancel upstream call if client disconnects
         var client = factory.CreateClient();
-        using var upstreamResponse = await client.SendAsync(
+
+        try
+        {
+            using var upstreamResponse = await client.SendAsync(
             upstreamRequest,
             HttpCompletionOption.ResponseHeadersRead,
-            ctx.RequestAborted);
+            linkedCts.Token);
 
-        // 5. Stream response back to client
-        await CopyDownstreamResponse(ctx, upstreamResponse);
+            // 5. Stream response back to client
+            await CopyDownstreamResponse(ctx, upstreamResponse, linkedCts.Token);
 
-        logger.LogInformation(
-            "Proxy {Method} {Path} -> {Upstream} {StatusCode} corr={CorrelationId}",
-            ctx.Request.Method,
-            ctx.Request.Path.Value,
-            upstreamUri.ToString(),
-            (int)upstreamResponse.StatusCode,
-            correlationId
-        );
+            logger.LogInformation(
+                "Proxy {Method} {Path} -> {Upstream} {StatusCode} corr={CorrelationId} timeoutMs={TimeoutMs}",
+                ctx.Request.Method,
+                ctx.Request.Path.Value,
+                upstreamUri.ToString(),
+                (int)upstreamResponse.StatusCode,
+                correlationId,
+                (int)routeTimeout.TotalMilliseconds
+            );
+        }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !ctx.RequestAborted.IsCancellationRequested)
+        {
+
+            if (!ctx.Response.HasStarted)
+            {
+                ctx.Response.StatusCode = StatusCodes.Status504GatewayTimeout;
+                await ctx.Response.WriteAsync($"Gateway timeout after {(int)routeTimeout.TotalMilliseconds}ms");
+            }
+
+            logger.LogWarning(
+                "Timeout proxying {Method} {Path} -> {Upstream} corr={CorrelationId} timeoutMs={TimeoutMs}",
+                ctx.Request.Method,
+                ctx.Request.Path.Value,
+                upstreamUri.ToString(),
+                correlationId,
+                (int)routeTimeout.TotalMilliseconds
+            );
+        }
+        catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested)
+        {
+            logger.LogInformation(
+                "Client disconnected {Method} {Path} corr={CorrelationId}",
+                ctx.Request.Method,
+                ctx.Request.Path.Value,
+                correlationId
+            );
+        }
+
+
     }
 
     private static Uri BuildUpstreamUri(string baseUrl, string path, string? query)
@@ -116,7 +154,7 @@ public static class Proxy
         }
     }
 
-    private static async Task CopyDownstreamResponse(HttpContext ctx, HttpResponseMessage upstreamResponse)
+    private static async Task CopyDownstreamResponse(HttpContext ctx, HttpResponseMessage upstreamResponse, CancellationToken token)
     {
         ctx.Response.StatusCode = (int)upstreamResponse.StatusCode;
 
@@ -127,18 +165,20 @@ public static class Proxy
             if (!HopByHop.Contains(h.Key)) ctx.Response.Headers[h.Key] = h.Value.ToArray();
 
         // Stream body to client; cancel if client disconnects
-        await upstreamResponse.Content.CopyToAsync(ctx.Response.Body, ctx.RequestAborted);
+        await upstreamResponse.Content.CopyToAsync(ctx.Response.Body, token);
     }
 
     // Finds longest matching route prefix. Returns upstream base URL and remaining path.
     private static bool TryMatch(
         string requestPath,
-        IReadOnlyDictionary<string, string> routes,
+        IReadOnlyDictionary<string, RouteConfig> routes,
         out string upstreamBase,
-        out string forwardPath)
+        out string forwardPath,
+        out TimeSpan routeTimeout)
     {
         upstreamBase = "";
         forwardPath = "";
+        routeTimeout = default;
         string? match = null;
 
         // Longest prefix wins: /api/a/ping matches "/api/a" over "/api"
@@ -151,7 +191,10 @@ public static class Proxy
 
         if (match is null) return false;
 
-        upstreamBase = routes[match];
+        var cfg = routes[match];
+        upstreamBase = cfg.UpstreamBaseUrl;
+        routeTimeout = cfg.Timeout;
+
         var rest = requestPath.Substring(match.Length);
         forwardPath = string.IsNullOrEmpty(rest) ? "/" : rest.StartsWith("/") ? rest : "/" + rest;
         return true;

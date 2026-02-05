@@ -11,10 +11,16 @@ builder.Services.AddHttpClient();
 var app = builder.Build();
 
 // Route table: path prefix → upstream URL (from env vars, with fallback defaults)
-var routes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+var routes = new Dictionary<string, RouteConfig>(StringComparer.OrdinalIgnoreCase)
 {
-    ["/api/a"] = Environment.GetEnvironmentVariable("UPSTREAM_SERVICE_A") ?? throw new Exception("UPSTREAM_SERVICE_A not set in .env"),
-    ["/api/b"] = Environment.GetEnvironmentVariable("UPSTREAM_SERVICE_B") ?? throw new Exception("UPSTREAM_SERVICE_B not set in .env"),
+    ["/api/a"] = new RouteConfig(
+        Environment.GetEnvironmentVariable("UPSTREAM_SERVICE_A") ?? throw new Exception("UPSTREAM_SERVICE_A not set in .env"),
+        TimeSpan.FromMilliseconds(int.TryParse(Environment.GetEnvironmentVariable("TIMEOUT_API_A_MS"), out var a) ? a : 1500)
+    ),
+    ["/api/b"] = new RouteConfig(
+        Environment.GetEnvironmentVariable("UPSTREAM_SERVICE_B") ?? throw new Exception("UPSTREAM_SERVICE_B not set in .env"),
+        TimeSpan.FromMilliseconds(int.TryParse(Environment.GetEnvironmentVariable("TIMEOUT_API_B_MS"), out var b) ? b : 1500)
+    ),
 };
 
 // Catch-all route captures every request and forwards to Proxy.HandleAsync
