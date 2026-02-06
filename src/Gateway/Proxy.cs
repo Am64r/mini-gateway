@@ -1,4 +1,5 @@
 using System.Net.Http.Headers;
+using System.Text.RegularExpressions;
 
 namespace Gateway;
 
@@ -38,7 +39,7 @@ public static class Proxy
 
         // 1. Match route: find upstream for this path prefix
         var requestPath = ctx.Request.Path.Value ?? "/";
-        if (!TryMatch(requestPath, routes, out var upstreamBase, out var forwardPath, out var routeTimeout, out var routeConfig))
+        if (!TryMatch(requestPath, routes, out var upstreamBase, out var forwardPath, out var routeTimeout, out var routeConfig, out var matchedPrefix))
         {
             ctx.Response.StatusCode = StatusCodes.Status404NotFound;
             await ctx.Response.WriteAsync("No route matched.");
@@ -63,6 +64,23 @@ public static class Proxy
         {
             ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
             await ctx.Response.WriteAsync("Missing or invalid X-Api-Key");
+            return;
+        }
+
+        var clientId = isAnonymous
+            ? ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown"
+            : ctx.Request.Headers[Auth.ApiKeyHeader].FirstOrDefault() ?? "unknown";
+
+        var rateResult = RateLimiter.Check(clientId, matchedPrefix, routeConfig);
+        if (!rateResult.Allowed)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+            ctx.Response.Headers["Retry-After"] = ((int)Math.Ceiling(rateResult.retryAfter.TotalSeconds)).ToString();
+            await ctx.Response.WriteAsync("Rate limit exceeded");
+            logger.LogWarning(
+                "Rate limited {ClientId} on {Path} corr={CorrelationId}",
+                clientId, ctx.Request.Path.Value, correlationId
+                );
             return;
         }
 
@@ -188,12 +206,14 @@ public static class Proxy
         out string upstreamBase,
         out string forwardPath,
         out TimeSpan routeTimeout,
-        out RouteConfig routeConfig)
+        out RouteConfig routeConfig,
+        out string matchedPrefix)
     {
         upstreamBase = "";
         forwardPath = "";
         routeTimeout = default;
         routeConfig = default!;
+        matchedPrefix = "";
         string? match = null;
 
         // Longest prefix wins: /api/a/ping matches "/api/a" over "/api"
@@ -209,6 +229,7 @@ public static class Proxy
         routeConfig = routes[match];
         upstreamBase = routeConfig.UpstreamBaseUrl;
         routeTimeout = routeConfig.Timeout;
+        matchedPrefix = match;
 
         var rest = requestPath.Substring(match.Length);
         forwardPath = string.IsNullOrEmpty(rest) ? "/" : rest.StartsWith("/") ? rest : "/" + rest;

@@ -11,24 +11,26 @@ sequenceDiagram
     participant U as Upstream (ServiceA/B)
 
     C->>G: request (/api/a/* or /api/b/*)
-    G->>G: route match + auth check + timeout budget
+    G->>G: route match + auth check + rate limit + timeout budget
     G->>G: ensure X-Correlation-Id
     G->>U: forward (streaming)
     U-->>G: response (streaming)
     G-->>C: response (+ X-Correlation-Id)
 ```
 
-### Decision flow (auth + timeout)
+### Decision flow (auth + rate limit + timeout)
 
 ```mermaid
 flowchart TD
     R[Request arrives at Gateway] --> M{Route match?}
     M -- no --> N[404]
     M -- yes --> A{Anonymous path?}
-    A -- yes --> F[Forward upstream]
+    A -- yes --> RL{Under rate limit?}
     A -- no --> K{Valid X-Api-Key?}
     K -- no --> U401[401]
-    K -- yes --> F[Forward upstream]
+    K -- yes --> RL
+    RL -- no --> U429[429 + Retry-After]
+    RL -- yes --> F[Forward upstream]
     F --> T{Finished before timeout?}
     T -- no --> U504[504 + cancel upstream]
     T -- yes --> OK[Return upstream response]
@@ -40,6 +42,7 @@ flowchart TD
 |---|---|
 | 401 | Missing/invalid `X-Api-Key` (non-anonymous route) |
 | 404 | No matching route prefix |
+| 429 | Client exceeded per-route rate limit (includes `Retry-After` header) |
 | 504 | Upstream exceeded per-route timeout budget |
 
 ## Architecture
@@ -53,6 +56,7 @@ flowchart LR
     subgraph Gateway[Gateway :5050]
         R[Route Matcher]
         A0[Auth + Admission]
+        RL[Rate Limiter]
         T[Timeout + Cancellation]
         P[Proxy Handler]
     end
@@ -64,7 +68,7 @@ flowchart LR
 
     C1 -->|/api/a/*| R
     C1 -->|/api/b/*| R
-    R --> A0 --> T --> P
+    R --> A0 --> RL --> T --> P
     P -->|/api/a/* → /*| A
     P -->|/api/b/* → /*| B
 ```
@@ -108,20 +112,18 @@ The gateway enforces a simple API key at the edge:
 - **Anonymous allowlist**: per-route `AllowAnonymousPrefixes` (e.g. `["/health"]`)
 - **Important**: the gateway should **not forward** `X-Api-Key` to upstreams (avoid credential leakage via upstream logs/bugs).
 
+### Rate Limiting (per route, per client IP address)
+Fixed-window counter using `ConcurrentDictionary` + `Interlocked.Increment`:
+- **Key**: `{routePrefix}:{clientId}` — authenticated clients keyed by API key, anonymous by IP
+- **Config**: `RequestsPerWindow` and `Window` per route (via `.env`)
+- **Response**: `429 Too Many Requests` with `Retry-After` header (seconds until window resets)
+- **Trade-off**: fixed-window is approximate under concurrency (off by a few requests at window boundaries) — acceptable for a gateway protecting upstreams from overload.
+
 ## Setup
 
 ```bash
 # Copy env template and adjust if needed
 cp .env.example .env
-```
-
-The `.env` file configures upstream URLs and per-route timeouts:
-```
-UPSTREAM_SERVICE_A=http://localhost:5051
-UPSTREAM_SERVICE_B=http://localhost:5052
-TIMEOUT_API_A_MS=1500
-TIMEOUT_API_B_MS=1500
-API_KEY=dev-key
 ```
 
 ## Running
@@ -156,7 +158,7 @@ curl -H "X-Api-Key: dev-key" http://localhost:5050/api/b/ping
 - [x] **M2**: Correlation IDs & logging
 - [x] **M3**: Timeouts & cancellation
 - [x] **M4**: Authentication
-- [ ] **M5**: Rate limiting (429)
+- [x] **M5**: Rate limiting (429)
 - [ ] **M6**: Concurrency bulkhead (429)
 - [ ] **M7**: Retries (safe methods only)
 - [ ] **M8**: Circuit breaker
