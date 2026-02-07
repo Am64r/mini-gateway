@@ -11,14 +11,14 @@ sequenceDiagram
     participant U as Upstream (ServiceA/B)
 
     C->>G: request (/api/a/* or /api/b/*)
-    G->>G: route match + auth check + rate limit + timeout budget
+    G->>G: route match + auth + rate limit + bulkhead + timeout
     G->>G: ensure X-Correlation-Id
     G->>U: forward (streaming)
     U-->>G: response (streaming)
     G-->>C: response (+ X-Correlation-Id)
 ```
 
-### Decision flow (auth + rate limit + timeout)
+### Decision flow (auth + rate limit + bulkhead + timeout)
 
 ```mermaid
 flowchart TD
@@ -29,11 +29,15 @@ flowchart TD
     A -- no --> K{Valid X-Api-Key?}
     K -- no --> U401[401]
     K -- yes --> RL
-    RL -- no --> U429[429 + Retry-After]
-    RL -- yes --> F[Forward upstream]
+    RL -- no --> U429a[429 + Retry-After]
+    RL -- yes --> BH{Bulkhead slot available?}
+    BH -- no --> U429b[429]
+    BH -- yes --> F[Forward upstream]
     F --> T{Finished before timeout?}
     T -- no --> U504[504 + cancel upstream]
     T -- yes --> OK[Return upstream response]
+    OK --> REL[Release bulkhead slot]
+    U504 --> REL
 ```
 
 ### Response codes (gateway)
@@ -42,7 +46,7 @@ flowchart TD
 |---|---|
 | 401 | Missing/invalid `X-Api-Key` (non-anonymous route) |
 | 404 | No matching route prefix |
-| 429 | Client exceeded per-route rate limit (includes `Retry-After` header) |
+| 429 | Rate limit exceeded (per-client, includes `Retry-After`) or bulkhead full (global) |
 | 504 | Upstream exceeded per-route timeout budget |
 
 ## Architecture
@@ -57,6 +61,7 @@ flowchart LR
         R[Route Matcher]
         A0[Auth + Admission]
         RL[Rate Limiter]
+        BH[Bulkhead]
         T[Timeout + Cancellation]
         P[Proxy Handler]
     end
@@ -68,7 +73,7 @@ flowchart LR
 
     C1 -->|/api/a/*| R
     C1 -->|/api/b/*| R
-    R --> A0 --> RL --> T --> P
+    R --> A0 --> RL --> BH --> T --> P
     P -->|/api/a/* → /*| A
     P -->|/api/b/* → /*| B
 ```
@@ -112,12 +117,19 @@ The gateway enforces a simple API key at the edge:
 - **Anonymous allowlist**: per-route `AllowAnonymousPrefixes` (e.g. `["/health"]`)
 - **Important**: the gateway should **not forward** `X-Api-Key` to upstreams (avoid credential leakage via upstream logs/bugs).
 
-### Rate Limiting (per route, per client IP address)
+### Rate Limiting (per route, per client)
 Fixed-window counter using `ConcurrentDictionary` + `Interlocked.Increment`:
 - **Key**: `{routePrefix}:{clientId}` — authenticated clients keyed by API key, anonymous by IP
 - **Config**: `RequestsPerWindow` and `Window` per route (via `.env`)
 - **Response**: `429 Too Many Requests` with `Retry-After` header (seconds until window resets)
 - **Trade-off**: fixed-window is approximate under concurrency (off by a few requests at window boundaries) — acceptable for a gateway protecting upstreams from overload.
+
+### Concurrency Bulkhead (per route, global)
+Limits in-flight requests to each upstream using a semaphore per route:
+- **Semaphore**: a lock that allows N holders instead of 1. Acquire decrements, release increments.
+- **Config**: `MaxConcurrentRequests` per route (via `.env`)
+- **Response**: `429 Too Many Requests` (no `Retry-After` — retry immediately, a slot may free up)
+- **Why both?** Rate limiting (M5) ensures fairness — one client can't hog capacity. Bulkhead (M6) ensures safety — the upstream won't be overwhelmed regardless of how many clients are sending requests.
 
 ## Setup
 
@@ -159,7 +171,7 @@ curl -H "X-Api-Key: dev-key" http://localhost:5050/api/b/ping
 - [x] **M3**: Timeouts & cancellation
 - [x] **M4**: Authentication
 - [x] **M5**: Rate limiting (429)
-- [ ] **M6**: Concurrency bulkhead (429)
+- [x] **M6**: Concurrency bulkhead (429)
 - [ ] **M7**: Retries (safe methods only)
 - [ ] **M8**: Circuit breaker
 - [ ] **M9**: Observability

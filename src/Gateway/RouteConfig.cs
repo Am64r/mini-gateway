@@ -5,4 +5,5 @@ public sealed record RouteConfig(
     TimeSpan Timeout,
     string[] AllowAnonymousPrefixes,
     int RequestsPerWindow,
-    TimeSpan Window);
+    TimeSpan Window,
+    int MaxConcurrentRequests);
