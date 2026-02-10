@@ -173,9 +173,14 @@ public static class Proxy
                     }
                 }
 
-                // Wait before next attempt
+                // Exponential backoff: 100ms, 200ms, 400ms, ...
+                // Jitter: add 0-50% random to prevent thundering herd
                 if (attempt < maxAttempts)
-                    await Task.Delay(routeConfig.RetryDelay);
+                {
+                    var baseDelay = routeConfig.RetryDelay.TotalMilliseconds * Math.Pow(2, attempt - 1);
+                    var jitter = baseDelay * Random.Shared.NextDouble() * 0.5;
+                    await Task.Delay(TimeSpan.FromMilliseconds(baseDelay + jitter));
+                }
             }
 
             // Got a response — send it to client
