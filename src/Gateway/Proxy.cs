@@ -1,5 +1,4 @@
 using System.Net.Http.Headers;
-using System.Text.RegularExpressions;
 
 namespace Gateway;
 
@@ -20,7 +19,6 @@ public static class Proxy
         IHttpClientFactory factory,
         IReadOnlyDictionary<string, RouteConfig> routes)
     {
-
         var logger = ctx.RequestServices
             .GetRequiredService<ILoggerFactory>()
             .CreateLogger("Gateway");
@@ -29,31 +27,23 @@ public static class Proxy
         var correlationId = ctx.Request.Headers[CorrelationHeader].FirstOrDefault();
         if (string.IsNullOrWhiteSpace(correlationId))
         {
-            // if correlationId doesn't exist, create a new one
             correlationId = Guid.NewGuid().ToString();
         }
 
-        // adds the correlationId to the http response headers
-        // this is what lets the client see the ID the gateway is using
+        // Echo correlation ID back to client
         ctx.Response.Headers[CorrelationHeader] = correlationId;
 
-        // 1. Match route: find upstream for this path prefix
+        // 1. Match route
         var requestPath = ctx.Request.Path.Value ?? "/";
         if (!TryMatch(requestPath, routes, out var upstreamBase, out var forwardPath, out var routeTimeout, out var routeConfig, out var matchedPrefix))
         {
             ctx.Response.StatusCode = StatusCodes.Status404NotFound;
             await ctx.Response.WriteAsync("No route matched.");
-
-            // we typically don't need to log 404's since the client should fix their path, 
-            // however we can see debug logs in verbose mode
-            logger.LogDebug(
-                "No route matched: {Path}",
-                requestPath
-            );
-
+            logger.LogDebug("No route matched: {Path}", requestPath);
             return;
         }
 
+        // 2. Auth check
         var expectedKey = Environment.GetEnvironmentVariable("API_KEY");
         if (string.IsNullOrWhiteSpace(expectedKey))
             throw new Exception("API_KEY not set in .env");
@@ -67,6 +57,7 @@ public static class Proxy
             return;
         }
 
+        // 3. Rate limit check
         var clientId = isAnonymous
             ? ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown"
             : ctx.Request.Headers[Auth.ApiKeyHeader].FirstOrDefault() ?? "unknown";
@@ -77,104 +68,141 @@ public static class Proxy
             ctx.Response.StatusCode = StatusCodes.Status429TooManyRequests;
             ctx.Response.Headers["Retry-After"] = ((int)Math.Ceiling(rateResult.retryAfter.TotalSeconds)).ToString();
             await ctx.Response.WriteAsync("Rate limit exceeded");
-            logger.LogWarning(
-                "Rate limited {ClientId} on {Path} corr={CorrelationId}",
-                clientId, ctx.Request.Path.Value, correlationId
-                );
+            logger.LogWarning("Rate limited {ClientId} on {Path} corr={CorrelationId}",
+                clientId, ctx.Request.Path.Value, correlationId);
             return;
         }
 
-        // 2. Build upstream URI: /api/a/ping?x=1 → http://localhost:5051/ping?x=1
+        // 4. Build upstream URI
         var upstreamUri = BuildUpstreamUri(upstreamBase, forwardPath, ctx.Request.QueryString.Value);
 
+        // 5. Bulkhead check
         if (!await Bulkhead.TryAcquire(matchedPrefix))
         {
             ctx.Response.StatusCode = StatusCodes.Status429TooManyRequests;
             await ctx.Response.WriteAsync("Too many concurrent requests");
-            logger.LogWarning(
-                "Bulkhead full for {Route} corr={CorrelationId}",
-                matchedPrefix, correlationId);
+            logger.LogWarning("Bulkhead full for {Route} corr={CorrelationId}", matchedPrefix, correlationId);
             return;
         }
 
         try
         {
-            // 3. Create upstream request with method, filtered headers, body stream
-            using var upstreamRequest = CreateUpstreamRequest(ctx.Request, upstreamUri, correlationId);
-
-            using var timeoutCts = new CancellationTokenSource(routeConfig.Timeout);
-            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted, timeoutCts.Token);
-
-            // 4. Send request
-            // - ResponseHeadersRead: stream body instead of buffering entire response
-            // - ctx.RequestAborted: cancel upstream call if client disconnects
+            // Only retry safe (idempotent) methods — POST might cause duplicate side effects
+            var canRetry = Retry.IsSafeHttpMethod(ctx.Request.Method);
+            var maxAttempts = canRetry ? routeConfig.MaxRetries + 1 : 1;
             var client = factory.CreateClient();
 
-            try
+            HttpResponseMessage? upstreamResponse = null;
+
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
             {
-                using var upstreamResponse = await client.SendAsync(
-                upstreamRequest,
-                HttpCompletionOption.ResponseHeadersRead,
-                linkedCts.Token);
+                // HttpRequestMessage can only be sent once — must recreate each attempt
+                using var upstreamRequest = CreateUpstreamRequest(ctx.Request, upstreamUri, correlationId);
 
-                // 5. Stream response back to client
-                await CopyDownstreamResponse(ctx, upstreamResponse, linkedCts.Token);
+                // Fresh timeout per attempt
+                using var timeoutCts = new CancellationTokenSource(routeConfig.Timeout);
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted, timeoutCts.Token);
 
-                logger.LogInformation(
-                    "Proxy {Method} {Path} -> {Upstream} {StatusCode} corr={CorrelationId} timeoutMs={TimeoutMs}",
-                    ctx.Request.Method,
-                    ctx.Request.Path.Value,
-                    upstreamUri.ToString(),
-                    (int)upstreamResponse.StatusCode,
-                    correlationId,
-                    (int)routeConfig.Timeout.TotalMilliseconds
-                );
-            }
-            catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !ctx.RequestAborted.IsCancellationRequested)
-            {
-
-                if (!ctx.Response.HasStarted)
+                try
                 {
-                    ctx.Response.StatusCode = StatusCodes.Status504GatewayTimeout;
-                    await ctx.Response.WriteAsync($"Gateway timeout after {(int)routeTimeout.TotalMilliseconds}ms");
+                    upstreamResponse = await client.SendAsync(
+                        upstreamRequest,
+                        HttpCompletionOption.ResponseHeadersRead,
+                        linkedCts.Token);
+
+                    // 2xx/3xx/4xx — don't retry
+                    if (!Retry.ShouldRetry(upstreamResponse, null))
+                        break;
+
+                    // 5xx — log and retry if attempts remain
+                    logger.LogWarning(
+                        "Upstream {Status}, attempt {Attempt}/{Max} for {Method} {Path} corr={CorrelationId}",
+                        (int)upstreamResponse.StatusCode, attempt, maxAttempts,
+                        ctx.Request.Method, ctx.Request.Path.Value, correlationId);
+
+                    upstreamResponse.Dispose();
+                    upstreamResponse = null;
+                }
+                catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !ctx.RequestAborted.IsCancellationRequested)
+                {
+                    if (attempt < maxAttempts)
+                    {
+                        logger.LogWarning(
+                            "Timeout, attempt {Attempt}/{Max} for {Method} {Path} corr={CorrelationId}",
+                            attempt, maxAttempts, ctx.Request.Method, ctx.Request.Path.Value, correlationId);
+                    }
+                    else
+                    {
+                        if (!ctx.Response.HasStarted)
+                        {
+                            ctx.Response.StatusCode = StatusCodes.Status504GatewayTimeout;
+                            await ctx.Response.WriteAsync($"Gateway timeout after {(int)routeTimeout.TotalMilliseconds}ms");
+                        }
+                        logger.LogWarning(
+                            "Timeout proxying {Method} {Path} -> {Upstream} corr={CorrelationId}",
+                            ctx.Request.Method, ctx.Request.Path.Value, upstreamUri.ToString(), correlationId);
+                        return;
+                    }
+                }
+                catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested)
+                {
+                    logger.LogInformation(
+                        "Client disconnected {Method} {Path} corr={CorrelationId}",
+                        ctx.Request.Method, ctx.Request.Path.Value, correlationId);
+                    return;
+                }
+                catch (HttpRequestException ex)
+                {
+                    if (attempt < maxAttempts)
+                    {
+                        logger.LogWarning(
+                            "Connection error ({Error}), attempt {Attempt}/{Max} for {Method} {Path} corr={CorrelationId}",
+                            ex.Message, attempt, maxAttempts, ctx.Request.Method, ctx.Request.Path.Value, correlationId);
+                    }
+                    else
+                    {
+                        if (!ctx.Response.HasStarted)
+                        {
+                            ctx.Response.StatusCode = StatusCodes.Status502BadGateway;
+                            await ctx.Response.WriteAsync("Upstream connection failed");
+                        }
+                        logger.LogError(
+                            "Upstream failed {Method} {Path} corr={CorrelationId} error={Error}",
+                            ctx.Request.Method, ctx.Request.Path.Value, correlationId, ex.Message);
+                        return;
+                    }
                 }
 
-                logger.LogWarning(
-                    "Timeout proxying {Method} {Path} -> {Upstream} corr={CorrelationId} timeoutMs={TimeoutMs}",
-                    ctx.Request.Method,
-                    ctx.Request.Path.Value,
-                    upstreamUri.ToString(),
-                    correlationId,
-                    (int)routeTimeout.TotalMilliseconds
-                );
+                // Wait before next attempt
+                if (attempt < maxAttempts)
+                    await Task.Delay(routeConfig.RetryDelay);
             }
-            catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested)
+
+            // Got a response — send it to client
+            if (upstreamResponse is not null)
             {
+                await CopyDownstreamResponse(ctx, upstreamResponse, CancellationToken.None);
                 logger.LogInformation(
-                    "Client disconnected {Method} {Path} corr={CorrelationId}",
-                    ctx.Request.Method,
-                    ctx.Request.Path.Value,
-                    correlationId
-                );
+                    "Proxy {Method} {Path} -> {Upstream} {StatusCode} corr={CorrelationId}",
+                    ctx.Request.Method, ctx.Request.Path.Value, upstreamUri.ToString(),
+                    (int)upstreamResponse.StatusCode, correlationId);
+                upstreamResponse.Dispose();
             }
         }
         finally
         {
             Bulkhead.Release(matchedPrefix);
         }
-
     }
 
     private static Uri BuildUpstreamUri(string baseUrl, string path, string? query)
         => new Uri($"{baseUrl}{path}{query ?? ""}");
 
-    private static HttpRequestMessage CreateUpstreamRequest(HttpRequest incoming, Uri upstreamUri, string CorrelationId)
+    private static HttpRequestMessage CreateUpstreamRequest(HttpRequest incoming, Uri upstreamUri, string correlationId)
     {
         var req = new HttpRequestMessage(new HttpMethod(incoming.Method), upstreamUri);
+        req.Headers.TryAddWithoutValidation(CorrelationHeader, correlationId);
 
-        req.Headers.TryAddWithoutValidation(CorrelationHeader, CorrelationId);
-
-        // Attach body as stream (no buffering) if present
         if (incoming.ContentLength > 0 || incoming.Headers.ContainsKey("Transfer-Encoding"))
         {
             req.Content = new StreamContent(incoming.Body);
@@ -194,8 +222,6 @@ public static class Proxy
             if (h.Key.Equals(CorrelationHeader, StringComparison.OrdinalIgnoreCase)) continue;
             if (h.Key.Equals(Auth.ApiKeyHeader, StringComparison.OrdinalIgnoreCase)) continue;
 
-
-            // Try request headers first, fall back to content headers
             if (!to.Headers.TryAddWithoutValidation(h.Key, h.Value.ToArray()))
                 to.Content?.Headers.TryAddWithoutValidation(h.Key, h.Value.ToArray());
         }
@@ -205,17 +231,14 @@ public static class Proxy
     {
         ctx.Response.StatusCode = (int)upstreamResponse.StatusCode;
 
-        // Copy response + content headers (excluding hop-by-hop)
         foreach (var h in upstreamResponse.Headers)
             if (!HopByHop.Contains(h.Key)) ctx.Response.Headers[h.Key] = h.Value.ToArray();
         foreach (var h in upstreamResponse.Content.Headers)
             if (!HopByHop.Contains(h.Key)) ctx.Response.Headers[h.Key] = h.Value.ToArray();
 
-        // Stream body to client; cancel if client disconnects
         await upstreamResponse.Content.CopyToAsync(ctx.Response.Body, token);
     }
 
-    // Finds longest matching route prefix. Returns upstream base URL and remaining path.
     private static bool TryMatch(
         string requestPath,
         IReadOnlyDictionary<string, RouteConfig> routes,
@@ -232,7 +255,6 @@ public static class Proxy
         matchedPrefix = "";
         string? match = null;
 
-        // Longest prefix wins: /api/a/ping matches "/api/a" over "/api"
         foreach (var prefix in routes.Keys)
         {
             if (requestPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))

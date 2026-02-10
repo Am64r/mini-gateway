@@ -6,4 +6,6 @@ public sealed record RouteConfig(
     string[] AllowAnonymousPrefixes,
     int RequestsPerWindow,
     TimeSpan Window,
-    int MaxConcurrentRequests);
+    int MaxConcurrentRequests,
+    int MaxRetries,
+    TimeSpan RetryDelay);

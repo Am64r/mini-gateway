@@ -19,7 +19,9 @@ var routes = new Dictionary<string, RouteConfig>(StringComparer.OrdinalIgnoreCas
         AllowAnonymousPrefixes: ["/health"],
         RequestsPerWindow: int.TryParse(Environment.GetEnvironmentVariable("RATE_LIMIT_API_A"), out var rla) ? rla : throw new Exception("RATE_LIMIT_API_A not set in .env"),
         Window: TimeSpan.FromMilliseconds(int.TryParse(Environment.GetEnvironmentVariable("RATE_WINDOW_API_A_MS"), out var rwa) ? rwa : throw new Exception("RATE_WINDOW_API_A_MS not set in .env")),
-        MaxConcurrentRequests: int.TryParse(Environment.GetEnvironmentVariable("MAX_CONCURRENT_REQUESTS_API_A"), out var mcra) ? mcra : throw new Exception("MAX_CONCURRENT_REQUESTS_API_A not set in .env")
+        MaxConcurrentRequests: int.TryParse(Environment.GetEnvironmentVariable("MAX_CONCURRENT_REQUESTS_API_A"), out var mcra) ? mcra : throw new Exception("MAX_CONCURRENT_REQUESTS_API_A not set in .env"),
+        MaxRetries: int.TryParse(Environment.GetEnvironmentVariable("MAX_RETRIES_API_A"), out var mreta) ? mreta : 2,
+        RetryDelay: TimeSpan.FromMilliseconds(int.TryParse(Environment.GetEnvironmentVariable("RETRY_DELAY_API_A_MS"), out var rda) ? rda : 100)
     ),
     ["/api/b"] = new RouteConfig(
         Environment.GetEnvironmentVariable("UPSTREAM_SERVICE_B") ?? throw new Exception("UPSTREAM_SERVICE_B not set in .env"),
@@ -27,7 +29,9 @@ var routes = new Dictionary<string, RouteConfig>(StringComparer.OrdinalIgnoreCas
         AllowAnonymousPrefixes: ["/health"],
         RequestsPerWindow: int.TryParse(Environment.GetEnvironmentVariable("RATE_LIMIT_API_B"), out var rlb) ? rlb : throw new Exception("RATE_LIMIT_API_B not set in .env"),
         Window: TimeSpan.FromMilliseconds(int.TryParse(Environment.GetEnvironmentVariable("RATE_WINDOW_API_B_MS"), out var rwb) ? rwb : throw new Exception("RATE_WINDOW_API_B_MS not set in .env")),
-        MaxConcurrentRequests: int.TryParse(Environment.GetEnvironmentVariable("MAX_CONCURRENT_REQUESTS_API_B"), out var mcrb) ? mcrb : throw new Exception("MAX_CONCURRENT_REQUESTS_API_B not set in .env")
+        MaxConcurrentRequests: int.TryParse(Environment.GetEnvironmentVariable("MAX_CONCURRENT_REQUESTS_API_B"), out var mcrb) ? mcrb : throw new Exception("MAX_CONCURRENT_REQUESTS_API_B not set in .env"),
+        MaxRetries: int.TryParse(Environment.GetEnvironmentVariable("MAX_RETRIES_API_B"), out var mretb) ? mretb : 2,
+        RetryDelay: TimeSpan.FromMilliseconds(int.TryParse(Environment.GetEnvironmentVariable("RETRY_DELAY_API_B_MS"), out var rdb) ? rdb : 100)
     ),
 };
 

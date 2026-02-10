@@ -13,12 +13,12 @@ sequenceDiagram
     C->>G: request (/api/a/* or /api/b/*)
     G->>G: route match + auth + rate limit + bulkhead + timeout
     G->>G: ensure X-Correlation-Id
-    G->>U: forward (streaming)
+    G->>U: forward (streaming, retry on 5xx/timeout for safe methods)
     U-->>G: response (streaming)
     G-->>C: response (+ X-Correlation-Id)
 ```
 
-### Decision flow (auth + rate limit + bulkhead + timeout)
+### Decision flow (auth + rate limit + bulkhead + retry + timeout)
 
 ```mermaid
 flowchart TD
@@ -33,11 +33,17 @@ flowchart TD
     RL -- yes --> BH{Bulkhead slot available?}
     BH -- no --> U429b[429]
     BH -- yes --> F[Forward upstream]
-    F --> T{Finished before timeout?}
-    T -- no --> U504[504 + cancel upstream]
-    T -- yes --> OK[Return upstream response]
+    F --> RS{Response?}
+    RS -- 5xx/timeout --> RT{Safe method + retries left?}
+    RT -- yes --> WAIT[Wait RetryDelay] --> F
+    RT -- no, timeout --> U504[504]
+    RT -- no, 5xx --> PASS[Return 5xx to client]
+    RT -- no, conn fail --> U502[502]
+    RS -- 2xx/3xx/4xx --> OK[Return upstream response]
     OK --> REL[Release bulkhead slot]
     U504 --> REL
+    U502 --> REL
+    PASS --> REL
 ```
 
 ### Response codes (gateway)
@@ -47,7 +53,8 @@ flowchart TD
 | 401 | Missing/invalid `X-Api-Key` (non-anonymous route) |
 | 404 | No matching route prefix |
 | 429 | Rate limit exceeded (per-client, includes `Retry-After`) or bulkhead full (global) |
-| 504 | Upstream exceeded per-route timeout budget |
+| 502 | Upstream connection failed (after all retries exhausted) |
+| 504 | Upstream exceeded per-route timeout budget (after all retries exhausted) |
 
 ## Architecture
 
@@ -131,6 +138,33 @@ Limits in-flight requests to each upstream using a semaphore per route:
 - **Response**: `429 Too Many Requests` (no `Retry-After` — retry immediately, a slot may free up)
 - **Why both?** Rate limiting (M5) ensures fairness — one client can't hog capacity. Bulkhead (M6) ensures safety — the upstream won't be overwhelmed regardless of how many clients are sending requests.
 
+### Design Decision: Fail Fast vs Queue
+
+When the bulkhead is full, we return 429 immediately instead of queuing the request. Why?
+
+**Problems with queuing inside the gateway:**
+- **Memory pile-up**: each queued request holds an HttpContext, connection, buffers. 1000 waiting requests = 1000 contexts in RAM.
+- **Client timeout mismatch**: client gives up after 10s, but the queue holds the request for 30s. The slot finally frees, we forward upstream, send response — but the client hung up 20s ago. Wasted work.
+- **Hidden backpressure**: 429 tells clients "slow down." A queue hides the problem — clients think everything is fine, keep sending, queue grows unbounded.
+- **Cascading failure**: upstream slow → slots don't free → queue grows → memory exhausted → gateway crashes.
+
+**Production architecture for high load:**
+1. **Gateway fails fast** — instant 429, don't hold connections
+2. **Client retries with exponential backoff** — client waits 100ms, 200ms, 400ms between retries. The *client* queues, server stays stateless
+3. **Load balancer distributes** — if Gateway 1 is full, route to Gateway 2
+4. **Autoscaling reacts** — 429 rate spikes → spin up more instances
+5. **Async for slow work** — return `202 Accepted` + job ID, process via message queue, client polls for result
+
+**The principle**: synchronous HTTP should be fast or fail. If it can't be fast, make it async. Queuing inside a synchronous gateway gives you the worst of both — you hold resources *and* make clients wait.
+
+### Retries (safe methods only)
+Automatic retry for transient upstream failures:
+- **Safe methods only**: GET, HEAD, OPTIONS are idempotent — retrying them is safe. POST/PUT/DELETE might cause duplicate side effects (e.g., charging a payment twice).
+- **Retry conditions**: 5xx responses, timeouts, connection failures. Never retry 4xx — that's a client error, retrying won't help.
+- **Config**: `MaxRetries` (number of additional attempts) and `RetryDelay` (wait between attempts) per route.
+- **Fresh timeout per attempt**: each retry gets its own timeout budget, so earlier attempts don't eat into later ones.
+- **Must recreate request**: `HttpRequestMessage` can only be sent once, so we rebuild it each attempt.
+
 ## Setup
 
 ```bash
@@ -172,7 +206,7 @@ curl -H "X-Api-Key: dev-key" http://localhost:5050/api/b/ping
 - [x] **M4**: Authentication
 - [x] **M5**: Rate limiting (429)
 - [x] **M6**: Concurrency bulkhead (429)
-- [ ] **M7**: Retries (safe methods only)
+- [x] **M7**: Retries (safe methods only)
 - [ ] **M8**: Circuit breaker
 - [ ] **M9**: Observability
 - [ ] **M10**: Load testing & analysis
