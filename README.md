@@ -161,7 +161,9 @@ When the bulkhead is full, we return 429 immediately instead of queuing the requ
 Automatic retry for transient upstream failures:
 - **Safe methods only**: GET, HEAD, OPTIONS are idempotent — retrying them is safe. POST/PUT/DELETE might cause duplicate side effects (e.g., charging a payment twice).
 - **Retry conditions**: 5xx responses, timeouts, connection failures. Never retry 4xx — that's a client error, retrying won't help.
-- **Config**: `MaxRetries` (number of additional attempts) and `RetryDelay` (wait between attempts) per route.
+- **Config**: `MaxRetries` (number of additional attempts) and `RetryDelay` (base delay) per route.
+- **Exponential backoff**: delay doubles each attempt (100ms → 200ms → 400ms). Gives the upstream more time to recover.
+- **Jitter**: adds 0-50% random delay to prevent thundering herd — when a service recovers, 1000 clients shouldn't all retry at exactly the same moment.
 - **Fresh timeout per attempt**: each retry gets its own timeout budget, so earlier attempts don't eat into later ones.
 - **Must recreate request**: `HttpRequestMessage` can only be sent once, so we rebuild it each attempt.
 
