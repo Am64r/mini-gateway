@@ -21,7 +21,10 @@ var routes = new Dictionary<string, RouteConfig>(StringComparer.OrdinalIgnoreCas
         Window: TimeSpan.FromMilliseconds(int.TryParse(Environment.GetEnvironmentVariable("RATE_WINDOW_API_A_MS"), out var rwa) ? rwa : throw new Exception("RATE_WINDOW_API_A_MS not set in .env")),
         MaxConcurrentRequests: int.TryParse(Environment.GetEnvironmentVariable("MAX_CONCURRENT_REQUESTS_API_A"), out var mcra) ? mcra : throw new Exception("MAX_CONCURRENT_REQUESTS_API_A not set in .env"),
         MaxRetries: int.TryParse(Environment.GetEnvironmentVariable("MAX_RETRIES_API_A"), out var mreta) ? mreta : 2,
-        RetryDelay: TimeSpan.FromMilliseconds(int.TryParse(Environment.GetEnvironmentVariable("RETRY_DELAY_API_A_MS"), out var rda) ? rda : 100)
+        RetryDelay: TimeSpan.FromMilliseconds(int.TryParse(Environment.GetEnvironmentVariable("RETRY_DELAY_API_A_MS"), out var rda) ? rda : 100),
+        CircuitBreakerThreshold: int.TryParse(Environment.GetEnvironmentVariable("CIRCUIT_THRESHOLD_API_A"), out var cta) ? cta : 5,
+        CircuitBreakerCooldown: TimeSpan.FromMilliseconds(int.TryParse(Environment.GetEnvironmentVariable("CIRCUIT_COOLDOWN_API_A_MS"), out var cca) ? cca : 30000)
+
     ),
     ["/api/b"] = new RouteConfig(
         Environment.GetEnvironmentVariable("UPSTREAM_SERVICE_B") ?? throw new Exception("UPSTREAM_SERVICE_B not set in .env"),
@@ -31,11 +34,14 @@ var routes = new Dictionary<string, RouteConfig>(StringComparer.OrdinalIgnoreCas
         Window: TimeSpan.FromMilliseconds(int.TryParse(Environment.GetEnvironmentVariable("RATE_WINDOW_API_B_MS"), out var rwb) ? rwb : throw new Exception("RATE_WINDOW_API_B_MS not set in .env")),
         MaxConcurrentRequests: int.TryParse(Environment.GetEnvironmentVariable("MAX_CONCURRENT_REQUESTS_API_B"), out var mcrb) ? mcrb : throw new Exception("MAX_CONCURRENT_REQUESTS_API_B not set in .env"),
         MaxRetries: int.TryParse(Environment.GetEnvironmentVariable("MAX_RETRIES_API_B"), out var mretb) ? mretb : 2,
-        RetryDelay: TimeSpan.FromMilliseconds(int.TryParse(Environment.GetEnvironmentVariable("RETRY_DELAY_API_B_MS"), out var rdb) ? rdb : 100)
+        RetryDelay: TimeSpan.FromMilliseconds(int.TryParse(Environment.GetEnvironmentVariable("RETRY_DELAY_API_B_MS"), out var rdb) ? rdb : 100),
+        CircuitBreakerThreshold: int.TryParse(Environment.GetEnvironmentVariable("CIRCUIT_THRESHOLD_API_B"), out var ctb) ? ctb : 5,
+        CircuitBreakerCooldown: TimeSpan.FromMilliseconds(int.TryParse(Environment.GetEnvironmentVariable("CIRCUIT_COOLDOWN_API_B_MS"), out var ccb) ? ccb : 30000)
     ),
 };
 
 Bulkhead.Init(routes);
+CircuitBreaker.Init(routes);
 
 // Catch-all route captures every request and forwards to Proxy.HandleAsync
 app.Map("/{**catchall}", (HttpContext ctx, IHttpClientFactory factory) =>

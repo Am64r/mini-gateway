@@ -11,7 +11,7 @@ sequenceDiagram
     participant U as Upstream (ServiceA/B)
 
     C->>G: request (/api/a/* or /api/b/*)
-    G->>G: route match + auth + rate limit + bulkhead + timeout
+    G->>G: route match + auth + rate limit + circuit breaker + bulkhead + timeout
     G->>G: ensure X-Correlation-Id
     G->>U: forward (streaming, retry on 5xx/timeout for safe methods)
     U-->>G: response (streaming)
@@ -30,7 +30,9 @@ flowchart TD
     K -- no --> U401[401]
     K -- yes --> RL
     RL -- no --> U429a[429 + Retry-After]
-    RL -- yes --> BH{Bulkhead slot available?}
+    RL -- yes --> CB{Circuit closed?}
+    CB -- no --> U503[503]
+    CB -- yes --> BH{Bulkhead slot available?}
     BH -- no --> U429b[429]
     BH -- yes --> F[Forward upstream]
     F --> RS{Response?}
@@ -54,6 +56,7 @@ flowchart TD
 | 404 | No matching route prefix |
 | 429 | Rate limit exceeded (per-client, includes `Retry-After`) or bulkhead full (global) |
 | 502 | Upstream connection failed (after all retries exhausted) |
+| 503 | Circuit breaker open — upstream is down, not even attempting |
 | 504 | Upstream exceeded per-route timeout budget (after all retries exhausted) |
 
 ## Architecture
@@ -68,6 +71,7 @@ flowchart LR
         R[Route Matcher]
         A0[Auth + Admission]
         RL[Rate Limiter]
+        CB[Circuit Breaker]
         BH[Bulkhead]
         T[Timeout + Cancellation]
         P[Proxy Handler]
@@ -80,7 +84,7 @@ flowchart LR
 
     C1 -->|/api/a/*| R
     C1 -->|/api/b/*| R
-    R --> A0 --> RL --> BH --> T --> P
+    R --> A0 --> RL --> CB --> BH --> T --> P
     P -->|/api/a/* → /*| A
     P -->|/api/b/* → /*| B
 ```
@@ -157,6 +161,14 @@ When the bulkhead is full, we return 429 immediately instead of queuing the requ
 
 **The principle**: synchronous HTTP should be fast or fail. If it can't be fast, make it async. Queuing inside a synchronous gateway gives you the worst of both — you hold resources *and* make clients wait.
 
+### Circuit Breaker (per route)
+Tracks consecutive upstream failures per route using a state machine:
+- **Closed**: healthy — requests flow through, failures are counted
+- **Open**: upstream is broken — reject all requests immediately with 503, don't waste resources trying. Failures counted against a configurable threshold (e.g., 5 consecutive failures trips the circuit).
+- **Half-Open**: cooldown expired — allow exactly one test request through. If it succeeds, close the circuit (upstream recovered). If it fails, reopen and restart the cooldown.
+- **Config**: `CircuitBreakerThreshold` (failures to trip) and `CircuitBreakerCooldown` (how long to wait before testing) per route.
+- **Why it matters**: retries handle transient failures (one bad request). The circuit breaker handles sustained failures (upstream is down). Without it, retries just amplify the problem — 1000 clients each retrying 3x = 3000 requests hitting a service that's already struggling to recover.
+
 ### Retries (safe methods only)
 Automatic retry for transient upstream failures:
 - **Safe methods only**: GET, HEAD, OPTIONS are idempotent — retrying them is safe. POST/PUT/DELETE might cause duplicate side effects (e.g., charging a payment twice).
@@ -209,6 +221,6 @@ curl -H "X-Api-Key: dev-key" http://localhost:5050/api/b/ping
 - [x] **M5**: Rate limiting (429)
 - [x] **M6**: Concurrency bulkhead (429)
 - [x] **M7**: Retries (safe methods only)
-- [ ] **M8**: Circuit breaker
+- [x] **M8**: Circuit breaker
 - [ ] **M9**: Observability
 - [ ] **M10**: Load testing & analysis

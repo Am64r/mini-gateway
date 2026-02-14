@@ -76,6 +76,14 @@ public static class Proxy
         // 4. Build upstream URI
         var upstreamUri = BuildUpstreamUri(upstreamBase, forwardPath, ctx.Request.QueryString.Value);
 
+        if (!CircuitBreaker.AllowRequest(matchedPrefix))
+        {
+            ctx.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+            await ctx.Response.WriteAsync("Service temporarily unavailable (circuit open)");
+            logger.LogWarning("Circuit open for {Route} corr={CorrelationId}", matchedPrefix, correlationId);
+            return;
+        }
+
         // 5. Bulkhead check
         if (!await Bulkhead.TryAcquire(matchedPrefix))
         {
@@ -141,6 +149,7 @@ public static class Proxy
                         logger.LogWarning(
                             "Timeout proxying {Method} {Path} -> {Upstream} corr={CorrelationId}",
                             ctx.Request.Method, ctx.Request.Path.Value, upstreamUri.ToString(), correlationId);
+                        CircuitBreaker.RecordFailure(matchedPrefix);
                         return;
                     }
                 }
@@ -169,6 +178,7 @@ public static class Proxy
                         logger.LogError(
                             "Upstream failed {Method} {Path} corr={CorrelationId} error={Error}",
                             ctx.Request.Method, ctx.Request.Path.Value, correlationId, ex.Message);
+                        CircuitBreaker.RecordFailure(matchedPrefix);
                         return;
                     }
                 }
@@ -183,6 +193,18 @@ public static class Proxy
                 }
             }
 
+            if (upstreamResponse is null)
+            {
+                if (!ctx.Response.HasStarted)
+                {
+                    ctx.Response.StatusCode = StatusCodes.Status502BadGateway;
+                    await ctx.Response.WriteAsync("Upstream returned error after all retries");
+                }
+                CircuitBreaker.RecordFailure(matchedPrefix);
+                return;
+            }
+
+
             // Got a response — send it to client
             if (upstreamResponse is not null)
             {
@@ -191,6 +213,7 @@ public static class Proxy
                     "Proxy {Method} {Path} -> {Upstream} {StatusCode} corr={CorrelationId}",
                     ctx.Request.Method, ctx.Request.Path.Value, upstreamUri.ToString(),
                     (int)upstreamResponse.StatusCode, correlationId);
+                CircuitBreaker.RecordSuccess(matchedPrefix);
                 upstreamResponse.Dispose();
             }
         }

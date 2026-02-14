@@ -8,4 +8,6 @@ public sealed record RouteConfig(
     TimeSpan Window,
     int MaxConcurrentRequests,
     int MaxRetries,
-    TimeSpan RetryDelay);
+    TimeSpan RetryDelay,
+    int CircuitBreakerThreshold,
+    TimeSpan CircuitBreakerCooldown);
