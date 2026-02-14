@@ -169,6 +169,15 @@ Tracks consecutive upstream failures per route using a state machine:
 - **Config**: `CircuitBreakerThreshold` (failures to trip) and `CircuitBreakerCooldown` (how long to wait before testing) per route.
 - **Why it matters**: retries handle transient failures (one bad request). The circuit breaker handles sustained failures (upstream is down). Without it, retries just amplify the problem — 1000 clients each retrying 3x = 3000 requests hitting a service that's already struggling to recover.
 
+### Observability
+A `/gateway/status` endpoint exposes the internal state of the gateway in real time:
+- **Uptime**: how long the gateway has been running
+- **Per-route metrics**: total requests, total errors, average latency
+- **Circuit breaker state**: Closed, Open, or HalfOpen per route
+- **Bulkhead availability**: how many concurrent slots are free vs max per route
+- **No auth required**: the status endpoint is registered before the catch-all route so it bypasses the proxy pipeline entirely
+- **Thread safety**: request/error counters use `Interlocked.Increment`, latency uses a lock for running average — same patterns as the rate limiter
+
 ### Retries (safe methods only)
 Automatic retry for transient upstream failures:
 - **Safe methods only**: GET, HEAD, OPTIONS are idempotent — retrying them is safe. POST/PUT/DELETE might cause duplicate side effects (e.g., charging a payment twice).
@@ -209,6 +218,9 @@ curl -H "X-Api-Key: dev-key" http://localhost:5050/api/a/fail?rate=0.5
 
 # Through gateway → ServiceB
 curl -H "X-Api-Key: dev-key" http://localhost:5050/api/b/ping
+
+# Gateway status (no auth required)
+curl http://localhost:5050/gateway/status | jq
 ```
 
 ## Milestones
@@ -222,5 +234,5 @@ curl -H "X-Api-Key: dev-key" http://localhost:5050/api/b/ping
 - [x] **M6**: Concurrency bulkhead (429)
 - [x] **M7**: Retries (safe methods only)
 - [x] **M8**: Circuit breaker
-- [ ] **M9**: Observability
+- [x] **M9**: Observability
 - [ ] **M10**: Load testing & analysis

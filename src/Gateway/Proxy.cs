@@ -1,4 +1,5 @@
 using System.Net.Http.Headers;
+using System.Text.RegularExpressions;
 
 namespace Gateway;
 
@@ -43,6 +44,8 @@ public static class Proxy
             return;
         }
 
+        var sw = Metrics.StartRequest(matchedPrefix);
+
         // 2. Auth check
         var expectedKey = Environment.GetEnvironmentVariable("API_KEY");
         if (string.IsNullOrWhiteSpace(expectedKey))
@@ -81,6 +84,7 @@ public static class Proxy
             ctx.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
             await ctx.Response.WriteAsync("Service temporarily unavailable (circuit open)");
             logger.LogWarning("Circuit open for {Route} corr={CorrelationId}", matchedPrefix, correlationId);
+            Metrics.RecordError(matchedPrefix, sw);
             return;
         }
 
@@ -90,6 +94,7 @@ public static class Proxy
             ctx.Response.StatusCode = StatusCodes.Status429TooManyRequests;
             await ctx.Response.WriteAsync("Too many concurrent requests");
             logger.LogWarning("Bulkhead full for {Route} corr={CorrelationId}", matchedPrefix, correlationId);
+            Metrics.RecordError(matchedPrefix, sw);
             return;
         }
 
@@ -150,6 +155,7 @@ public static class Proxy
                             "Timeout proxying {Method} {Path} -> {Upstream} corr={CorrelationId}",
                             ctx.Request.Method, ctx.Request.Path.Value, upstreamUri.ToString(), correlationId);
                         CircuitBreaker.RecordFailure(matchedPrefix);
+                        Metrics.RecordError(matchedPrefix, sw);
                         return;
                     }
                 }
@@ -179,6 +185,7 @@ public static class Proxy
                             "Upstream failed {Method} {Path} corr={CorrelationId} error={Error}",
                             ctx.Request.Method, ctx.Request.Path.Value, correlationId, ex.Message);
                         CircuitBreaker.RecordFailure(matchedPrefix);
+                        Metrics.RecordError(matchedPrefix, sw);
                         return;
                     }
                 }
@@ -201,6 +208,7 @@ public static class Proxy
                     await ctx.Response.WriteAsync("Upstream returned error after all retries");
                 }
                 CircuitBreaker.RecordFailure(matchedPrefix);
+                Metrics.RecordError(matchedPrefix, sw);
                 return;
             }
 
@@ -214,6 +222,7 @@ public static class Proxy
                     ctx.Request.Method, ctx.Request.Path.Value, upstreamUri.ToString(),
                     (int)upstreamResponse.StatusCode, correlationId);
                 CircuitBreaker.RecordSuccess(matchedPrefix);
+                Metrics.RecordSuccess(matchedPrefix, sw);
                 upstreamResponse.Dispose();
             }
         }

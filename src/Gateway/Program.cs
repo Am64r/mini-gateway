@@ -43,6 +43,8 @@ var routes = new Dictionary<string, RouteConfig>(StringComparer.OrdinalIgnoreCas
 Bulkhead.Init(routes);
 CircuitBreaker.Init(routes);
 
+app.MapGet("/gateway/status", () => Results.Json(Metrics.GetSnapshot(routes)));
+
 // Catch-all route captures every request and forwards to Proxy.HandleAsync
 app.Map("/{**catchall}", (HttpContext ctx, IHttpClientFactory factory) =>
     Proxy.HandleAsync(ctx, factory, routes));

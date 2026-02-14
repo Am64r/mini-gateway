@@ -34,4 +34,11 @@ public static class Bulkhead
         if (Semaphores.TryGetValue(routePrefix, out var semaphore))
             semaphore.Release();
     }
+
+    public static int GetAvailable(string routePrefix)
+    {
+        if (Semaphores.TryGetValue(routePrefix, out var semaphore))
+            return semaphore.CurrentCount;
+        return -1;
+    }
 }
