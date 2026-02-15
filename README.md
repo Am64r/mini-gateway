@@ -188,6 +188,27 @@ Automatic retry for transient upstream failures:
 - **Fresh timeout per attempt**: each retry gets its own timeout budget, so earlier attempts don't eat into later ones.
 - **Must recreate request**: `HttpRequestMessage` can only be sent once, so we rebuild it each attempt.
 
+### Load Testing (k6)
+Five k6 scripts in `loadtest/` validate each safety mechanism under realistic concurrency:
+
+| Script | What it proves |
+|---|---|
+| `baseline.js` | Happy path — 50 VUs, 100% success, p95 < 200ms |
+| `rate-limit.js` | Hammers a low-limit route — exactly N requests pass, rest get 429 with `Retry-After` |
+| `bulkhead.js` | 250 VUs hit a slow endpoint — only `MaxConcurrentRequests` pass, rest rejected instantly |
+| `circuit-breaker.js` | Two phases: trip the circuit with 100% failures (503s), then recover after cooldown (200s) |
+| `stress.js` | Ramp 0→200 VUs — gateway stays healthy (zero 5xx), rate limiter absorbs the overflow |
+
+```bash
+# Install k6
+brew install k6
+
+# Run a test (gateway + upstreams must be running)
+k6 run loadtest/baseline.js
+```
+
+**Key insight from stress testing**: as load increases, the middleware layers activate in order — rate limiter rejects excess traffic (429), bulkhead caps concurrency, circuit breaker protects failing upstreams. The gateway itself never crashes or returns 5xx. That's the whole point: each layer is a safety net for the one below it.
+
 ## Setup
 
 ```bash
@@ -235,4 +256,4 @@ curl http://localhost:5050/gateway/status | jq
 - [x] **M7**: Retries (safe methods only)
 - [x] **M8**: Circuit breaker
 - [x] **M9**: Observability
-- [ ] **M10**: Load testing & analysis
+- [x] **M10**: Load testing & analysis
